@@ -1,0 +1,76 @@
+# Node.js / TypeScript (backend & shared)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.env
+.env.*.local
+*.local
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+lerna-debug.log*
+
+# OS files
+.DS_Store
+Icon?
+Thumbs.db
+
+# IDEs and editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Expo & React Native (frontend)
+.expo/
+.expo-shared/
+web-build/
+*.expo.sh
+android/
+ios/
+**/__generated__/
+*.keystore
+.gradle/
+*.iml
+
+# Metro bundler
+.reactnative/
+.expo/
+.expo-cache/
+.expo-shared/
+
+# Yarn Plug’n’Play
+.pnp.*
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# Buck (React Native)
+buck-out/
+\.buckd/
+*.keystore
+
+# CocoaPods (iOS builds)
+ios/Pods/
+ios/Podfile.lock
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# Misc
+*.swp
