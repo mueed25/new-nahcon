@@ -2,7 +2,7 @@
 // npm install express mysql2 cors helmet dotenv
 // npm install -D @types/express @types/node @types/cors typescript ts-node nodemon
 
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import mysql from 'mysql2/promise';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -18,31 +18,66 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
-// Database configuration
-const dbConfig = {
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'nahcongov_contacts23',
-  port: parseInt(process.env.DB_PORT || '3306')
-};
+// Add this function before your dbConfig object (around line 18)
+function parseDatabaseUrl(url: string) {
+  const urlObj = new URL(url);
+  return {
+    host: urlObj.hostname,
+    user: urlObj.username,
+    password: urlObj.password,
+    database: urlObj.pathname.slice(1), // Remove leading slash
+    port: parseInt(urlObj.port)
+  };
+}
+
+// Replace your existing dbConfig object (around line 20-26) with this:
+const dbConfig = process.env.DATABASE_URL 
+  ? parseDatabaseUrl(process.env.DATABASE_URL)
+  : {
+      host: process.env.DB_HOST || 'localhost',
+      user: process.env.DB_USER || 'root',
+      password: process.env.DB_PASSWORD || '',
+      database: process.env.DB_NAME || 'nahcongov_contacts23',
+      port: parseInt(process.env.DB_PORT || '3306')
+    };
+
+// Add connection logging and testing
+console.log('Database configuration:', {
+  ...dbConfig,
+  password: '[HIDDEN]' // Don't log the actual password
+});
 
 // Create database connection pool
 const pool = mysql.createPool(dbConfig);
 
-// Interfaces matching your React Native structure
-interface Contact {
-  id: string;
-  name: string;
-  location: string;
-  phone: string;
-  whatsapp: string;
-  rank?: string;
-  category?: string;
-  province?: string;
-  state?: string;
+// Test database connection function
+async function testDatabaseConnection() {
+  try {
+    console.log('Testing database connection...');
+    const connection = await pool.getConnection();
+    console.log('✅ Database connected successfully');
+    
+    // Test a simple query
+    const [rows] = await connection.execute('SELECT 1 as test');
+    console.log('✅ Database query test passed:', rows);
+    
+    connection.release();
+    return true;
+  } catch (error: any) {
+    console.error('❌ Database connection failed:', error.message);
+    console.error('Error code:', error.code);
+    return false;
+  }
 }
 
+// Interfaces matching your React Native structure
+function safeParseInt(value: string | undefined, defaultValue: number): number {
+  if (!value) return defaultValue;
+  const parsed = parseInt(value, 10);
+  return isNaN(parsed) ? defaultValue : parsed;
+}
+
+// You'll also need this interface if not already defined
 interface ContactQueryParams {
   search?: string;
   location?: string;
@@ -51,6 +86,18 @@ interface ContactQueryParams {
   category?: string;
   limit?: string;
   offset?: string;
+}
+
+interface Contact {
+  id: string;
+  name: string;
+  location: string;
+  phone: string;
+  whatsapp: string;
+  rank: string;
+  province: string;
+  state: string;
+  category: string;
 }
 
 // Helper function to get location name from various category tables
@@ -174,10 +221,28 @@ function formatWhatsAppNumber(phone: string): string {
   return cleaned;
 }
 
-// Main API endpoint to get all contacts
-app.get('/api/contacts', async (req: Request<{}, {}, {}, ContactQueryParams>, res: Response) => {
+// Main API endpoint to get all contacts - FIXED VERSION
+app.get('/api/contacts', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { search, location, province, state, category, limit = '50', offset = '0' } = req.query;
+    const { search, location, province, state, category } = req.query as ContactQueryParams;
+    
+    // Safely parse limit and offset with proper integer conversion
+    const limitParam = req.query.limit as string;
+    const offsetParam = req.query.offset as string;
+    
+    const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10))) : 50;
+    const offset = offsetParam ? Math.max(0, parseInt(offsetParam, 10)) : 0;
+    
+    // Ensure they are valid numbers
+    if (isNaN(limit) || isNaN(offset)) {
+      res.status(400).json({ 
+        success: false, 
+        error: 'Invalid limit or offset parameters' 
+      });
+      return;
+    }
+    
+    console.log('Query params:', { search, location, province, state, category, limit, offset });
     
     let query = `
       SELECT 
@@ -209,32 +274,60 @@ app.get('/api/contacts', async (req: Request<{}, {}, {}, ContactQueryParams>, re
     const queryParams: any[] = [];
     
     // Add search filter
-    if (search) {
+    if (search && search.trim()) {
       query += ` AND (pr.f_name LIKE ? OR pr.l_name LIKE ? OR pr.phone LIKE ? OR pr.phone1 LIKE ? OR pr.phone2 LIKE ?)`;
-      const searchTerm = `%${search}%`;
+      const searchTerm = `%${search.trim()}%`;
       queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
     }
     
     // Add province filter
-    if (province) {
+    if (province && province.trim()) {
       query += ` AND p.province LIKE ?`;
-      queryParams.push(`%${province}%`);
+      queryParams.push(`%${province.trim()}%`);
     }
     
     // Add state filter
-    if (state) {
+    if (state && state.trim()) {
       query += ` AND s.state_name LIKE ?`;
-      queryParams.push(`%${state}%`);
+      queryParams.push(`%${state.trim()}%`);
     }
     
-    // Add pagination
-    query += ` LIMIT ? OFFSET ?`;
-    queryParams.push(parseInt(limit), parseInt(offset));
+    // Add location filter based on category
+    if (location && location.trim()) {
+      query += ` AND pr.location_id = (SELECT location_id FROM location WHERE location LIKE ? LIMIT 1)`;
+      queryParams.push(`%${location.trim()}%`);
+    }
     
-    const [rows] = await pool.execute(query, queryParams);
+    // First, let's try without LIMIT/OFFSET in prepared statement
+    // We'll use string interpolation for LIMIT/OFFSET as they must be integers
+    const finalQuery = query + ` LIMIT ${limit} OFFSET ${offset}`;
+    
+    console.log('Final query:', finalQuery);
+    console.log('Query params:', queryParams);
+    console.log('Param types:', queryParams.map(p => typeof p));
+    
+    const [rows] = await pool.execute(finalQuery, queryParams);
     
     if (!Array.isArray(rows)) {
-      return res.status(500).json({ error: 'Invalid database response' });
+      res.status(500).json({ error: 'Invalid database response' });
+      return;
+    }
+    
+    console.log(`Found ${rows.length} rows`);
+    
+    // If no data found, return empty array
+    if (rows.length === 0) {
+      res.json({
+        success: true,
+        data: [],
+        pagination: {
+          total: 0,
+          limit,
+          offset,
+          hasMore: false
+        }
+      });
+      return;
     }
     
     // Transform data to match React Native interface
@@ -279,20 +372,25 @@ app.get('/api/contacts', async (req: Request<{}, {}, {}, ContactQueryParams>, re
     
     const countParams: any[] = [];
     
-    if (search) {
+    if (search && search.trim()) {
       countQuery += ` AND (pr.f_name LIKE ? OR pr.l_name LIKE ? OR pr.phone LIKE ? OR pr.phone1 LIKE ? OR pr.phone2 LIKE ?)`;
-      const searchTerm = `%${search}%`;
+      const searchTerm = `%${search.trim()}%`;
       countParams.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
     }
     
-    if (province) {
+    if (province && province.trim()) {
       countQuery += ` AND p.province LIKE ?`;
-      countParams.push(`%${province}%`);
+      countParams.push(`%${province.trim()}%`);
     }
     
-    if (state) {
+    if (state && state.trim()) {
       countQuery += ` AND s.state_name LIKE ?`;
-      countParams.push(`%${state}%`);
+      countParams.push(`%${state.trim()}%`);
+    }
+    
+    if (location && location.trim()) {
+      countQuery += ` AND pr.location_id = (SELECT location_id FROM location WHERE location LIKE ? LIMIT 1)`;
+      countParams.push(`%${location.trim()}%`);
     }
     
     const [countRows] = await pool.execute(countQuery, countParams);
@@ -303,9 +401,9 @@ app.get('/api/contacts', async (req: Request<{}, {}, {}, ContactQueryParams>, re
       data: contacts,
       pagination: {
         total,
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        hasMore: parseInt(offset) + contacts.length < total
+        limit,
+        offset,
+        hasMore: offset + contacts.length < total
       }
     });
     
@@ -319,10 +417,206 @@ app.get('/api/contacts', async (req: Request<{}, {}, {}, ContactQueryParams>, re
   }
 });
 
-// Get contact by ID
-app.get('/api/contacts/:id', async (req: Request, res: Response) => {
+// Alternative implementation using query method instead of execute for LIMIT/OFFSET
+app.get('/api/contacts-alt', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { search, location, province, state, category } = req.query as ContactQueryParams;
+    
+    const limitParam = req.query.limit as string;
+    const offsetParam = req.query.offset as string;
+    
+    const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10))) : 50;
+    const offset = offsetParam ? Math.max(0, parseInt(offsetParam, 10)) : 0;
+    
+    if (isNaN(limit) || isNaN(offset)) {
+      res.status(400).json({ 
+        success: false, 
+        error: 'Invalid limit or offset parameters' 
+      });
+      return;
+    }
+    
+    let query = `
+      SELECT 
+        pr.record_id,
+        pr.rank,
+        pr.f_name,
+        pr.l_name,
+        pr.phone,
+        pr.phone1,
+        pr.phone2,
+        pr.location_id,
+        pr.mk_cat_id,
+        pr.md_cat_id,
+        pr.muas_cat_id,
+        pr.nrt_cat_id,
+        pr.field_cat_id,
+        pr.medical_cat_id,
+        pr.service_cat_id,
+        pr.province_id,
+        pr.state_id,
+        p.province,
+        s.state_name
+      FROM phone_record pr
+      LEFT JOIN province_info p ON pr.province_id = p.province_id
+      LEFT JOIN state_info s ON pr.state_id = s.state_id
+      WHERE 1=1
+    `;
+    
+    const queryParams: any[] = [];
+    
+    // Add filters
+    if (search && search.trim()) {
+      query += ` AND (pr.f_name LIKE ? OR pr.l_name LIKE ? OR pr.phone LIKE ? OR pr.phone1 LIKE ? OR pr.phone2 LIKE ?)`;
+      const searchTerm = `%${search.trim()}%`;
+      queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+    }
+    
+    if (province && province.trim()) {
+      query += ` AND p.province LIKE ?`;
+      queryParams.push(`%${province.trim()}%`);
+    }
+    
+    if (state && state.trim()) {
+      query += ` AND s.state_name LIKE ?`;
+      queryParams.push(`%${state.trim()}%`);
+    }
+    
+    if (location && location.trim()) {
+      query += ` AND pr.location_id = (SELECT location_id FROM location WHERE location LIKE ? LIMIT 1)`;
+      queryParams.push(`%${location.trim()}%`);
+    }
+    
+    // Use pool.query instead of pool.execute for LIMIT/OFFSET
+    query += ` LIMIT ${limit} OFFSET ${offset}`;
+    
+    console.log('Final query:', query);
+    console.log('Query params:', queryParams);
+    
+    const [rows] = await pool.query(query, queryParams);
+    
+    if (!Array.isArray(rows)) {
+      res.status(500).json({ error: 'Invalid database response' });
+      return;
+    }
+    
+    console.log(`Found ${rows.length} rows`);
+    
+    if (rows.length === 0) {
+      res.json({
+        success: true,
+        data: [],
+        pagination: {
+          total: 0,
+          limit,
+          offset,
+          hasMore: false
+        }
+      });
+      return;
+    }
+    
+    // Transform data
+    const contacts: Contact[] = await Promise.all(
+      rows.map(async (row: any) => {
+        const locationName = await getLocationName(
+          row.location_id || 0,
+          row.mk_cat_id || 0,
+          row.md_cat_id || 0,
+          row.muas_cat_id || 0,
+          row.nrt_cat_id || 0,
+          row.field_cat_id || 0,
+          row.medical_cat_id || 0,
+          row.service_cat_id || 0
+        );
+        
+        const fullName = `${row.f_name || ''} ${row.l_name || ''}`.trim();
+        const primaryPhone = row.phone || row.phone1 || row.phone2 || '';
+        
+        return {
+          id: row.record_id.toString(),
+          name: fullName || 'Unknown',
+          location: locationName,
+          phone: primaryPhone,
+          whatsapp: formatWhatsAppNumber(primaryPhone),
+          rank: row.rank || '',
+          province: row.province || '',
+          state: row.state_name || '',
+          category: locationName
+        };
+      })
+    );
+    
+    // Get total count
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM phone_record pr
+      LEFT JOIN province_info p ON pr.province_id = p.province_id
+      LEFT JOIN state_info s ON pr.state_id = s.state_id
+      WHERE 1=1
+    `;
+    
+    const countParams: any[] = [];
+    
+    if (search && search.trim()) {
+      countQuery += ` AND (pr.f_name LIKE ? OR pr.l_name LIKE ? OR pr.phone LIKE ? OR pr.phone1 LIKE ? OR pr.phone2 LIKE ?)`;
+      const searchTerm = `%${search.trim()}%`;
+      countParams.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+    }
+    
+    if (province && province.trim()) {
+      countQuery += ` AND p.province LIKE ?`;
+      countParams.push(`%${province.trim()}%`);
+    }
+    
+    if (state && state.trim()) {
+      countQuery += ` AND s.state_name LIKE ?`;
+      countParams.push(`%${state.trim()}%`);
+    }
+    
+    if (location && location.trim()) {
+      countQuery += ` AND pr.location_id = (SELECT location_id FROM location WHERE location LIKE ? LIMIT 1)`;
+      countParams.push(`%${location.trim()}%`);
+    }
+    
+    const [countRows] = await pool.query(countQuery, countParams);
+    const total = Array.isArray(countRows) ? (countRows[0] as any).total : 0;
+    
+    res.json({
+      success: true,
+      data: contacts,
+      pagination: {
+        total,
+        limit,
+        offset,
+        hasMore: offset + contacts.length < total
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error fetching contacts:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error',
+      message: process.env.NODE_ENV === 'development' ? (error as Error).message : undefined
+    });
+  }
+});
+
+// Get contact by ID - FIXED VERSION
+app.get('/api/contacts/:id', async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
+    
+    // Validate ID is a number
+    const contactId = parseInt(id, 10);
+    if (isNaN(contactId)) {
+      res.status(400).json({ 
+        success: false, 
+        error: 'Invalid contact ID' 
+      });
+      return;
+    }
     
     const query = `
       SELECT 
@@ -335,13 +629,14 @@ app.get('/api/contacts/:id', async (req: Request, res: Response) => {
       WHERE pr.record_id = ?
     `;
     
-    const [rows] = await pool.execute(query, [id]);
+    const [rows] = await pool.execute(query, [contactId]);
     
     if (!Array.isArray(rows) || rows.length === 0) {
-      return res.status(404).json({ 
+      res.status(404).json({ 
         success: false, 
         error: 'Contact not found' 
       });
+      return;
     }
     
     const row = rows[0] as any;
@@ -386,7 +681,7 @@ app.get('/api/contacts/:id', async (req: Request, res: Response) => {
 });
 
 // Get all locations for filtering
-app.get('/api/locations', async (req: Request, res: Response) => {
+app.get('/api/locations', async (req: Request, res: Response): Promise<void> => {
   try {
     const locations: string[] = [];
     
@@ -403,13 +698,17 @@ app.get('/api/locations', async (req: Request, res: Response) => {
     ];
     
     for (const { table, column } of tables) {
-      const [rows] = await pool.execute(`SELECT ${column} FROM ${table}`);
-      if (Array.isArray(rows)) {
-        rows.forEach((row: any) => {
-          if (row[column] && !locations.includes(row[column])) {
-            locations.push(row[column]);
-          }
-        });
+      try {
+        const [rows] = await pool.execute(`SELECT ${column} FROM ${table}`);
+        if (Array.isArray(rows)) {
+          rows.forEach((row: any) => {
+            if (row[column] && !locations.includes(row[column])) {
+              locations.push(row[column]);
+            }
+          });
+        }
+      } catch (tableError) {
+        console.warn(`Error fetching from ${table}:`, tableError);
       }
     }
     
@@ -428,7 +727,7 @@ app.get('/api/locations', async (req: Request, res: Response) => {
 });
 
 // Get all provinces
-app.get('/api/provinces', async (req: Request, res: Response) => {
+app.get('/api/provinces', async (req: Request, res: Response): Promise<void> => {
   try {
     const [rows] = await pool.execute('SELECT * FROM province_info ORDER BY province');
     
@@ -447,7 +746,7 @@ app.get('/api/provinces', async (req: Request, res: Response) => {
 });
 
 // Get all states
-app.get('/api/states', async (req: Request, res: Response) => {
+app.get('/api/states', async (req: Request, res: Response): Promise<void> => {
   try {
     const [rows] = await pool.execute('SELECT * FROM state_info ORDER BY state_name');
     
@@ -465,17 +764,62 @@ app.get('/api/states', async (req: Request, res: Response) => {
   }
 });
 
-// Health check endpoint
-app.get('/api/health', (req: Request, res: Response) => {
-  res.json({ 
-    success: true, 
-    message: 'API is running',
-    timestamp: new Date().toISOString()
-  });
+// Add a test endpoint to check if there's data in phone_record
+app.get('/api/test-data', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const [countResult] = await pool.execute('SELECT COUNT(*) as count FROM phone_record');
+    const count = Array.isArray(countResult) ? (countResult[0] as any).count : 0;
+    
+    const [sampleRows] = await pool.execute('SELECT * FROM phone_record LIMIT 5');
+    
+    res.json({
+      success: true,
+      phone_record_count: count,
+      sample_data: sampleRows,
+      tables_info: {
+        location: await pool.execute('SELECT COUNT(*) as count FROM location'),
+        provinces: await pool.execute('SELECT COUNT(*) as count FROM province_info'),
+        states: await pool.execute('SELECT COUNT(*) as count FROM state_info')
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error in test endpoint:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error',
+      message: (error as Error).message
+    });
+  }
+});
+
+// Enhanced health check endpoint with database test
+app.get('/api/health', async (req: Request, res: Response): Promise<void> => {
+  try {
+    // Test database connection
+    const connection = await pool.getConnection();
+    await connection.execute('SELECT 1 as test');
+    connection.release();
+    
+    res.json({ 
+      success: true, 
+      message: 'API is running',
+      database: 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error: any) {
+    res.status(500).json({ 
+      success: false, 
+      message: 'API is running but database connection failed',
+      database: 'disconnected',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Error handling middleware
-app.use((err: Error, req: Request, res: Response, next: any) => {
+app.use((err: Error, req: Request, res: Response, next: NextFunction): void => {
   console.error('Unhandled error:', err);
   res.status(500).json({ 
     success: false, 
@@ -484,18 +828,28 @@ app.use((err: Error, req: Request, res: Response, next: any) => {
 });
 
 // 404 handler
-app.use('*', (req: Request, res: Response) => {
+app.use((req: Request, res: Response): void => {
   res.status(404).json({ 
     success: false, 
-    error: 'Route not found' 
+    error: 'Route not found',
+    path: req.path 
   });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
-  console.log(`Contacts API: http://localhost:${PORT}/api/contacts`);
+// Test database connection on startup
+testDatabaseConnection().then((connected) => {
+  if (connected) {
+    // Start server
+    app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+      console.log(`Health check: http://localhost:${PORT}/api/health`);
+      console.log(`Contacts API: http://localhost:${PORT}/api/contacts`);
+      console.log(`Test data: http://localhost:${PORT}/api/test-data`);
+    });
+  } else {
+    console.error('Failed to start server due to database connection issues');
+    process.exit(1);
+  }
 });
 
 export default app;
